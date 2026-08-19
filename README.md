@@ -2,7 +2,7 @@
 
 ## 1. Motivation
 
-Modern dense LLMs (7–8B+ parameters) cannot fit inside the flash, DRAM, and SRAM budgets of real edge silicon even after aggressive pruning and quantization. Sparsity and low-bit quantization alone typically get an 8B model from ~16 GB (BF16) down to ~2–4 GB — still far above what an edge NPU with tens of MB of on-chip SRAM and a few GB of DRAM can hold or stream at real-time token rates.
+Modern dense LLMs (7–8B+ parameters) cannot fit inside the flash, DRAM, and SRAM budgets of real edge silicon even after aggressive pruning and quantization. Sparsity and low-bit quantization alone typically get an 8B model from ~16 GB (BF16) down to ~5–6 GB — still far above what an edge NPU with tens of MB of on-chip SRAM and a few GB of DRAM can hold or stream at real-time token rates.
 
 This project treats **compression as a first-class part of the inference datapath**, not just a storage optimization. The static weights are pruned, quantized, and then entropy-compressed offline; a **hardware decompression accelerator** reconstructs tiles of weights on the fly as they are streamed into the compute array, so the footprint in flash/DRAM stays at the compressed size while SRAM only ever holds one decompressed tile at a time. Because the KV cache is *not* static — it grows every decode step — it needs the mirror-image problem solved: a **hardware compression accelerator** that compresses freshly generated KV entries in real time before they are written back to DRAM, and decompresses them again on the read path during attention.
 
