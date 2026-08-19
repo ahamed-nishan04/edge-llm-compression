@@ -12,9 +12,6 @@ Annotated bibliography for the edge-LLM compression/decompression accelerator pr
 
 ## 2. Quantization
 
-- **Lin, Tang, Tang, Yang, Chen, Wang, Xiao, Dang, Gan & Han, "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration"** (MLSys 2024, Best Paper) — arXiv:2306.00978
-  Identifies that ~1% of weight channels are "salient" and derives per-channel scales from *activation* statistics (not weight magnitude) to protect them under low-bit quantization, without backprop or reconstruction. This is the 4-bit quantization stage used in this pipeline; also the basis of the TinyChat on-device inference runtime.
-
 - **Shen et al., "LLM-QAT: Data-Free Quantization Aware Training for Large Language Models"** (2023)
   First QAT method for LLMs; generates synthetic calibration data and distills the full-precision model's output/activation/weight distributions into the quantized model without needing the original training corpus — directly relevant to the QAT/QAFT recovery stage after pruning + AWQ.
 
@@ -54,6 +51,11 @@ Annotated bibliography for the edge-LLM compression/decompression accelerator pr
 
 - **"PD-Swap: Prefill-Decode Logic Swapping for End-to-End LLM Inference on Edge FPGAs via Dynamic Partial Reconfiguration"** — arXiv:2512.11550
   Documents the prefill/decode asymmetry (compute-bound vs. DRAM-bandwidth-bound) that motivates treating static-weight decompression and dynamic-KV compression as two separately optimized datapaths rather than one, which is the design split this project follows.
+
+## 6. Overall Reference for intial idea
+
+- **Han, Mao & Dally, "Deep Compression: Compressing Deep Neural Networks with Pruning, Trained Quantization and Huffman Coding" (ICLR 2016)** - arXiv:1510.00149
+Introduces a foundational three-stage compression pipeline consisting of pruning, trained quantization, and Huffman coding. This seminal paper significantly reduces the storage requirements of neural networks without loss of accuracy, making it a highly relevant predecessor to the three-stage compression/decompression pipeline targeted in this project's edge accelerator design.
 
 ## Suggested folder layout once PDFs are added
 
