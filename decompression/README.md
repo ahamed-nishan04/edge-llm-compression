@@ -1,63 +1,110 @@
-# Decompression Accelerator — Real-Time Weight Tile Reconstruction
+# Tile-wise Zstd Decompression Accelerator
 
-## Purpose
+Hardware pipeline for run time decompression of quantized LLM weights/KV-cache/
+FFN tensors, using 3 role-specific dictionaries and configurable tile size,
+targeting Shrutam-2/Sooktam-class edge NPUs.
 
-Attention (Q/K/V/O) and FFN/MoE-expert weight tiles are compressed **offline** with tile-wise Zstd after SparseGPT pruning, AWQ 4-bit quantization, and QAT/QAFT recovery. On the edge device these tiles live in flash/DRAM in their compressed form; they are only ever expanded to full width **inside SRAM, just before a tile is consumed by the MAC array**. This block is the hardware path that does that expansion in real time, so decode latency is fully hidden behind compute and SRAM never has to hold more than one (or a small pipelined handful of) decompressed tile(s).
+## Status: simulation-passing structural skeleton
 
-This is the *static* half of the codec (weights only — the dynamic KV-cache path lives in `/compression`, and is symmetric — see below).
-
-## Rough Pipeline Structure
+`tb/tb_zstd_decomp_top.sv` passes end-to-end: all 4 test tiles complete
+through DMA fetch -> tANS decode -> LZ reconstruct -> desparse -> dequant
+-> output, with correct tile-loop control flow, AXI burst sequencing
+across repeated tiles, backpressure through all 5 stages, and the
+scheduler correctly gating each new tile's fetch on the *previous* tile's
+full pipeline drain (not just its DMA fetch completing).
 
 ```
-Flash / DRAM (compressed tile stream)
-        │
-        ▼
- ┌───────────────────┐
- │  Tile Fetch / DMA  │  AXI-style burst reads, tile-header parsing (size, codec params,
- │  + Tile Scheduler  │  target SRAM bank), double-buffered so fetch of tile N+1 overlaps
- └─────────┬──────────┘  decode + consumption of tile N
-           ▼
- ┌───────────────────┐
- │  Sequence Decoder  │  Parses Zstd frame/block headers, separates the literals stream
- │  (LZ77 stage)      │  from the sequences (offset/match-length) stream, reconstructs
- │                    │  the raw byte stream via match-copy from the sliding window
- └─────────┬──────────┘
-           ▼
- ┌───────────────────┐
- │  Entropy Decode    │  FSE/tANS decode core for literals + sequence symbols (Huffman
- │  Core (FSE/tANS)   │  fallback path for literal-heavy tiles if the library selects it)
- └─────────┬──────────┘
-           ▼
- ┌───────────────────┐
- │  Dequant / Format  │  Unpacks AWQ 4-bit codes + per-group scale/zero-point back to the
- │  Reconstruction    │  compute array's native width (e.g. INT8-normalized for the MAC
- │                    │  array, per Shrutam-2), applies structured-sparsity mask reinsertion
- └─────────┬──────────┘
-           ▼
- ┌───────────────────┐
- │  Double-Buffered   │  Two (or more) SRAM banks per tile slot: one being written by the
- │  Output SRAM       │  decoder while the other feeds the MAC array — hides decode latency
- └─────────┬──────────┘
-           ▼
-      MAC Array (Shrutam-2 / Sooktam compute datapath)
+[TB] PASS: completed 4/4 tiles
 ```
 
-## Key Design Points to Work Out
+This validates **wiring and control flow** for arbitrary `TILE_SIZE_BYTES`
+/ `NUM_TILES` parameter choices. It does **not** yet validate bit-exact
+Zstd/tANS decode against a real compressed stream -- see "What's real vs.
+what's a documented skeleton" below.
 
-- **Tile granularity**: must be chosen jointly with the compression-ratio-vs-latency analysis in the main report — small enough that one tile's decode time fits comfortably under one MAC-array pass, large enough that per-tile metadata (Zstd frame header, FSE tables) doesn't dominate.
-- **Fixed-throughput vs. bursty decode**: entropy decoding is inherently variable-rate (see Huff-LLM's "bubble cycle" problem, `references/README.md`). The decoder needs either (a) a small output FIFO that absorbs rate variation before the double-buffered SRAM stage, or (b) a decode core wide enough (multi-symbol/cycle FSE table lookup) that worst-case throughput still beats the MAC array's consumption rate.
-- **Two consumers, two formats**: attention-tile and FFN/MoE-tile streams were compressed with separate library configurations (different literal alphabets / table sizes), so the entropy decode core either needs to be parameterizable per-stream or the design needs two lightweight instances sharing the same DMA/scheduler front end.
-- **MoE routing interaction**: for the 8-expert SMEAR FFN, only a subset of experts are active per token/batch — the tile scheduler should prefetch/decompress only the tiles for routed experts, not the whole FFN weight set, to avoid wasting decode bandwidth.
-- **Reuse from the prior general-purpose Zstd accelerator work**: the tANS decode core, AXI DMA block, and double-buffer scheduler design are being carried over and adapted (parameter widths, table sizes) rather than redesigned from scratch — only the dequant/reconstruction stage and MoE-aware scheduling are new for this project.
+## Layout
 
-## Interfaces
+```
+rtl/
+  zstd_decomp_top.sv    top module -- all tunable parameters live here
+  tile_scheduler.sv     tile loop FSM, double-buffer handshake, addressing
+  axi_dma_if.sv          AXI-512 read master + compressed-byte FIFO
+  tans_decoder.sv         tANS/FSE entropy decode front-end
+  lz_reconstruct.sv       LZ77 match reconstruction (history + dictionary)
+  desparse_unit.sv        2:4 structured-sparsity expansion (bypassable)
+  dequant_unit.sv          INT8 / NF4 / AWQ-INT4 dequantization
+  dict_mem.sv               3-bank dictionary memory (weights/KV/FFN)
+tb/
+  tb_zstd_decomp_top.sv   testbench + behavioral AXI memory model
+model/
+  golden_model.c            C reference (literal-passthrough + LZ + desparse
+                             + dequant), compiles and runs standalone
+```
 
-- **Upstream**: flash/DRAM controller (compressed tile stream + per-tile metadata table produced by the offline compression pipeline).
-- **Downstream**: MAC array input SRAM, in the compute array's native tile format (dimensions, quantization width) expected by Shrutam-2 / Sooktam.
+## Changing tile size / tile count
 
-## Open Items
+Every knob is a `parameter` on `zstd_decomp_top`:
 
-- [ ] Finalize tile size sweep (SRAM budget vs. decode-latency-hidden-behind-compute)
-- [ ] Decide FSE table storage strategy (per-tile embedded table vs. shared global table to save flash space)
-- [ ] Define MoE-aware prefetch policy for expert tile selection
-- [ ] Verify dequant stage matches the AWQ group size used during offline quantization
+```systemverilog
+zstd_decomp_top #(
+    .TILE_SIZE_BYTES (4096),   // decompressed bytes per tile
+    .NUM_TILES       (64),     // max tiles this instance can loop over
+    .NUM_DOUBLE_BUFS (2),      // buffering depth for fetch/decode overlap
+    .DICT_DEPTH_BYTES(32768)   // per-dictionary size (weights/KV/FFN)
+) u_decomp ( ... );
+```
+
+`num_tiles_this_run` (a runtime **input port**, not a parameter) lets you
+run fewer than `NUM_TILES` tiles per invocation without resynthesizing.
+
+## Running the testbench
+
+```
+iverilog -g2012 -o sim.out rtl/*.sv tb/tb_zstd_decomp_top.sv
+vvp sim.out
+```
+(tested with Icarus Verilog; `unique case` and constant-select warnings
+from iverilog are tool limitations, not functional issues -- both
+constructs are standard synthesizable SystemVerilog.)
+
+## What's real vs. what's a documented skeleton
+
+**Structurally real and verified:** top-level parameterization, tile
+scheduler FSM (fetch -> wait-for-fetch -> wait-for-pipeline-drain -> swap
+-> next, with a genuine per-tile address stride derived from
+`TILE_SIZE_BYTES`), AXI-512 DMA burst sequencing, FIFO occupancy
+accounting, valid/ready backpressure through every stage, dictionary bank
+selection, and the double-buffer swap handshake.
+
+**Documented skeleton, needs real implementation before tape-out /
+real-data testing:**
+- `tans_decoder.sv`: single-stream only (real Zstd uses 2-4 interleaved
+  FSE streams for throughput); bit-reader shifts 1 bit/cycle rather than
+  a real byte-aligned/bit-packed reader; LZ-token vs. literal
+  classification and the offset/length sub-decode are stubbed
+  (`out_is_lz_token` always 0 currently).
+- `lz_reconstruct.sv`: match-copy path is implemented (history + dictionary
+  addressing) but only exercised by literal symbols in the current test,
+  since the entropy stage doesn't yet emit real LZ tokens.
+- `desparse_unit.sv`: 2:4 group decode logic is implemented, but needs a
+  real 2:4-sparse-encoded input stream to exercise (this testbench
+  correctly bypasses it, since KV-cache-style dense tiles do too).
+- `dequant_unit.sv`: NF4 LUT values are placeholders -- verify against
+  your actual training-time NF4 quantile export before use.
+- Double-buffered SRAM staging for the *decompressed* side isn't modeled;
+  output streams straight to the consumer port. Add real staging if your
+  consumer can't keep up cycle-by-cycle.
+
+## Suggested next steps
+
+1. Point `golden_model.c` at real `zstd --ultra -22`-compressed tiles (or
+   a real FSE table export) and extend it to bit-exact tANS decode.
+2. Rewrite `tans_decoder.sv`'s bit-reader against that same bit-packing
+   convention, and wire real LZ-token decode into `out_is_lz_token`.
+3. Extend the testbench with a scoreboard: `$readmemh` golden-model output,
+   compare against `out_data` per tile.
+4. Once (1)-(3) pass, benchmark decompression throughput (bytes/sec) vs.
+   your target DRAM bandwidth at the tile size you'll actually use --
+   that ratio, not the compression ratio alone, is what determines
+   whether this gives you a throughput win or just a footprint win (see
+   the earlier discussion in this conversation).
