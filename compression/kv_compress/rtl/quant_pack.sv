@@ -45,11 +45,23 @@ module quant_pack #(
     logic signed [31:0] scaled_int;
     logic signed [31:0] scale_fixed;   // scale, widened from Q8.8 to Q16.16
     logic signed [63:0] div_result;
+    logic signed [63:0] numer;
+    logic signed [63:0] denom;
+    logic signed [63:0] half_abs;
+    logic signed [63:0] adj_numer;
+
     assign scale_fixed = {{16{scale[15]}}, scale} <<< 8;
-    assign div_result  = (scale_fixed != 0)
-                          ? ($signed({{32{in_data[31]}}, in_data}) <<< 16)
-                            / {{32{scale_fixed[31]}}, scale_fixed}
-                          : 64'sd0;
+    assign numer        = ($signed({{32{in_data[31]}}, in_data}) <<< 16);
+    assign denom         = {{32{scale_fixed[31]}}, scale_fixed};
+    // half_abs must represent half of one unit at the bit-16 (integer)
+    // boundary of the Q16.16 quotient, i.e. 0.5 * 2^16 * |denom|, not
+    // 0.5 * |denom|. Using the latter rounds the raw (pre-shift)
+    // quotient to its nearest 2^-16 value, which has no effect once the
+    // fractional bits are discarded by the final >>16 -- effectively
+    // truncating (flooring) instead of rounding to nearest integer.
+    assign half_abs      = (denom[63] ? -denom : denom) <<< 15;
+    assign adj_numer     = (numer[63] ^ denom[63]) ? (numer - half_abs) : (numer + half_abs);
+    assign div_result    = (scale_fixed != 0) ? (adj_numer / denom) : 64'sd0;
     assign scaled_int  = div_result[47:16]; // back to a plain integer
 
     logic signed [31:0] q_with_zero;
@@ -68,7 +80,10 @@ module quant_pack #(
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            out_byte   <= '0;
             out_valid  <= 1'b0;
+            out_last   <= 1'b0;
+            out_offset <= '0;
             offset_ctr <= '0;
         end else if (in_ready) begin
             out_byte   <= q_clamped;
@@ -76,7 +91,7 @@ module quant_pack #(
             out_last   <= in_last;
             out_offset <= offset_ctr;
             if (in_valid) begin
-                offset_ctr <= in_last ? '0 : offset_ctr + 1;
+                offset_ctr <= in_last ? '0 : offset_ctr + 1'b1;
             end
         end
     end

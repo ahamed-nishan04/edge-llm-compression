@@ -244,3 +244,38 @@ int main(void) {
     return (tokMatch && byteMatch) ? 0 : 1;
 }
 #endif
+
+#ifdef KV_GEN_VECTORS
+/* Emit golden vectors in a machine-parseable form for gen_kv_stimulus.py.
+ * Same tile as the self-test, so the two stay in step. */
+int main(void) {
+    float raw[16] = {
+        1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f,
+        1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f,
+        7.0f, 8.0f, 9.0f, 10.0f
+    };
+    int n = 16;
+    float scale = 1.0f; int8_t zero = 0;
+    uint8_t dict[8] = {0,0,0,0,0,0,0,0};
+
+    uint8_t quantized[MAX_TILE_BYTES];
+    quantize_int8(raw, n, scale, zero, quantized);
+
+    KvCompressedTile out;
+    kv_compress_tile(raw, n, scale, zero, dict, 0, &out);
+
+    for (int i = 0; i < n; i++) printf("raw[%d] = %d\n", i, (int)raw[i]);
+    for (int i = 0; i < n; i++) printf("quant[%d] = 0x%02x\n", i, quantized[i]);
+    for (int i = 0; i < out.tokenLen; i++) printf("token[%d] = %d\n", i, out.tokens[i]);
+    for (int i = 0; i < out.compressedBytes; i++)
+        printf("comp[%d] = 0x%02x\n", i, out.compressed[i]);
+
+    printf("num_raw = %d\n", n);
+    printf("num_tokens = %d\n", out.tokenLen);
+    printf("num_comp_bytes = %d\n", out.compressedBytes);
+    printf("init_state = %d\n", out.initState);
+    printf("quant_scale_q88 = %d\n", (int)(scale * 256.0f));
+    printf("quant_zero = %d\n", (int)zero);
+    return 0;
+}
+#endif

@@ -76,8 +76,16 @@ module lz_match_finder #(
             fill_count         <= in_last ? '0 : fill_count + 1;
         end
     end
-
-    logic [TILE_ADDR_WIDTH-1:0] tile_len_q; // latched total length once in_last seen
+    typedef enum logic [2:0] {
+        S_WAIT_TILE, S_LOOKUP, S_EXTEND_HIST, S_EXTEND_DICT, S_DECIDE, S_EMIT, S_DONE
+    } state_e;
+    state_e st, st_n;
+    // WIDTH FIX: a full tile length is TILE_SIZE_BYTES, which needs
+    // TILE_ADDR_WIDTH+1 bits, not TILE_ADDR_WIDTH. At 16 bytes,
+    // in_offset+1 = 16 wrapped to 0 in a 4-bit register, making
+    // (scan_ptr + 1 >= tile_len_q) trivially true so the FSM jumped to
+    // S_DONE after emitting exactly one token.
+    logic [TILE_ADDR_WIDTH:0] tile_len_q; // latched total length once in_last seen
     logic tile_ready_q;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -114,10 +122,7 @@ module lz_match_finder #(
     endfunction
 
     // ---------------- Match-finding FSM ----------------
-    typedef enum logic [2:0] {
-        S_WAIT_TILE, S_LOOKUP, S_EXTEND_HIST, S_EXTEND_DICT, S_DECIDE, S_EMIT, S_DONE
-    } state_e;
-    state_e st, st_n;
+
 
     logic [TILE_ADDR_WIDTH-1:0] scan_ptr;
     logic [HASH_BITS-1:0] cur_hash;

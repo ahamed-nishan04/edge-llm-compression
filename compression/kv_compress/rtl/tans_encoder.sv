@@ -116,6 +116,7 @@ module tans_encoder #(
     logic [SYM_ADDR_W-1:0] scan_sym;         // 0..256 scan cursor within a NORM_FIND_MAX pass
     logic [TOK_ADDR_W-1:0] cur_max_count;
     logic [SYM_ADDR_W-1:0] cur_max_sym;
+    logic [SYM_ADDR_W:0]   bump_remaining;   // freq=2 budget still to hand out
 
     // ---------------- BASE phase ----------------
     logic [SYM_ADDR_W-1:0] base_scan;
@@ -155,6 +156,8 @@ module tans_encoder #(
 
     // ---------------- SERIALIZE phase ----------------
     logic [TOK_ADDR_W-1:0] ser_i;
+    logic ser_done;           // set once the LAST token's byte(s) are queued
+    logic final_flush_pending; // see S_SER_STEP fix below
     logic [7:0] out_shreg;
     logic [3:0] out_bits_in_shreg;
     logic [31:0] byte_ctr;
@@ -177,16 +180,15 @@ module tans_encoder #(
         unique case (st)
             S_IDLE       : if (in_valid) st_n = S_COUNT;
             S_COUNT      : if (in_valid && in_ready && in_last) st_n = S_NORM_INIT;
-            S_NORM_INIT  : if (remaining_q == 0) st_n = S_BASE_INIT; else st_n = S_NORM_FIND_MAX;
+            S_NORM_INIT  : if (nbSymbols_q == 0) st_n = S_BWD_INIT; else st_n = S_NORM_FIND_MAX;
             S_NORM_FIND_MAX: if (scan_sym == NUM_SYMBOL_VALUES-1) st_n = S_NORM_MARK;
-            S_NORM_MARK  : if (remaining_ctr == 1) st_n = S_BASE_INIT; else st_n = S_NORM_FIND_MAX;
+            S_NORM_MARK  : if (remaining_ctr == 1) st_n = S_BWD_INIT; else st_n = S_NORM_FIND_MAX;
             S_BASE_INIT  : st_n = S_BASE_SCAN;
             S_BASE_SCAN  : if (base_scan == NUM_SYMBOL_VALUES-1) st_n = S_BWD_INIT;
             S_BWD_INIT   : st_n = S_BWD_STEP;
             S_BWD_STEP   : if (bwd_i == 0) st_n = S_SER_INIT;
             S_SER_INIT   : st_n = S_SER_STEP;
-            S_SER_STEP   : if (out_valid && out_ready && ser_i == n_tokens_q - 1 &&
-                                out_bits_in_shreg == 0) st_n = S_DONE;
+            S_SER_STEP   : if (ser_done && (!out_valid || out_ready)) st_n = S_DONE;
             S_DONE       : st_n = S_IDLE;
             default      : st_n = S_IDLE;
         endcase
@@ -199,6 +201,7 @@ module tans_encoder #(
             tableSize_q   <= '0;
             remaining_q   <= '0;
             remaining_ctr <= '0;
+            bump_remaining<= '0;
             scan_sym      <= '0;
             cur_max_count <= '0;
             cur_max_sym   <= '0;
@@ -207,6 +210,8 @@ module tans_encoder #(
             enc_state     <= '0;
             bwd_i         <= '0;
             ser_i         <= '0;
+            ser_done      <= 1'b0;
+            final_flush_pending <= 1'b0;
             out_shreg     <= '0;
             out_bits_in_shreg <= '0;
             byte_ctr      <= '0;
@@ -218,7 +223,26 @@ module tans_encoder #(
             unique case (st)
                 // ---- transition from COUNT: count distinct symbols,
                 // pick tableLog = ceil(log2(nbSymbols)) ----
-                S_IDLE: begin
+                //
+                // BUG FIX: this used to reset unconditionally on EVERY
+                // cycle spent in S_IDLE. in_ready is also high during
+                // S_IDLE (so the very first token of a tile can be
+                // accepted without wasting a cycle) -- and the separate
+                // COUNT-phase tally always_ff block (above) ALSO writes
+                // raw_count[in_symbol] on that exact same cycle whenever
+                // in_valid && in_ready. Two different always_ff blocks
+                // writing the same array element on the same edge is a
+                // multi-driver race with implementation-defined outcome;
+                // in practice this reset always won, silently discarding
+                // the count for whichever symbol happened to be the
+                // FIRST token of every tile (raw_count[1] measured 0
+                // instead of 1 for this test tile's first token, value
+                // 1, even though the separate tally block's increment
+                // executed on the same cycle). Only reset when NOT also
+                // accepting a token this cycle; prior idle cycles (while
+                // waiting for the host to start feeding data) already
+                // clear everything before the first real token arrives.
+                S_IDLE: if (!(in_valid && in_ready)) begin
                     for (int s = 0; s < NUM_SYMBOL_VALUES; s++) begin
                         raw_count[s]     <= '0;
                         freq[s]          <= '0;
@@ -230,9 +254,25 @@ module tans_encoder #(
                     // observed one, in the SAME pass (combinational scan
                     // over all 257 counters -- fine, this runs once, not
                     // per-token)
+                    //
+                    // BUG FIX: this scan and the raw_count[in_symbol]<=+1
+                    // tally (separate always_ff block above) are BOTH
+                    // triggered by this SAME edge (the one carrying
+                    // in_last). By nonblocking-assignment semantics, a
+                    // read of raw_count[] here is guaranteed to see the
+                    // PRE-increment value -- so the LAST token's own
+                    // symbol was never counted as observed: raw_count[s]
+                    // for s==in_symbol still reads as whatever it was
+                    // BEFORE this token, which is 0 if this token's value
+                    // never appeared earlier in the tile. This is not a
+                    // simulator race; it's guaranteed, deterministic LRM
+                    // behavior, and was silently dropping the final
+                    // symbol from nbSymbols/freq/the whole extraction
+                    // loop every single run. Fix: explicitly count this
+                    // cycle's own in_symbol as observed too.
                     nb_count = 0;
                     for (int s = 0; s < NUM_SYMBOL_VALUES; s++) begin
-                        if (raw_count[s] != 0) begin
+                        if (raw_count[s] != 0 || s == int'(in_symbol)) begin
                             freq[s] <= 16'd1;
                             nb_count = nb_count + 1;
                         end
@@ -247,7 +287,26 @@ module tans_encoder #(
                     tableLog_q  <= tl_scratch[SYM_ADDR_W:0];
                     tableSize_q <= (STATE_BITS+1)'(1 << tl_scratch);
                     remaining_q <= (SYM_ADDR_W+1)'((1 << tl_scratch) - nbSymbols_q);
-                    remaining_ctr <= (SYM_ADDR_W+1)'((1 << tl_scratch) - nbSymbols_q);
+                    // BUG FIX: this used to run remaining_q (the freq=2
+                    // "bump budget") iterations, then hand off to a
+                    // SEPARATE ascending-symbol-value scan (S_BASE_SCAN)
+                    // to build base_tbl. That is wrong whenever tie-
+                    // breaking or count-based reordering moved any symbol
+                    // out of ascending-value order -- which golden's
+                    // fse_codec.c always does, since fse_build_table()
+                    // assigns base[] while walking symbols in the SAME
+                    // descending-raw-count order (ties broken by
+                    // ascending value) that build_freq_table() sorted
+                    // them into, not in ascending symbol-value order.
+                    // Now this loop runs ALL nbSymbols_q extraction
+                    // iterations (not just the bump budget) and builds
+                    // base_tbl inline, in exactly that extraction order,
+                    // in S_NORM_MARK below. S_BASE_INIT/S_BASE_SCAN are
+                    // now dead states (unreachable, left in place rather
+                    // than deleted to keep this diff minimal).
+                    remaining_ctr <= {1'b0, nbSymbols_q};
+                    bump_remaining<= (SYM_ADDR_W+1)'((1 << tl_scratch) - nbSymbols_q);
+                    running_sum   <= '0;
                     scan_sym      <= '0;
                     cur_max_count <= '0;
                     cur_max_sym   <= '0;
@@ -263,8 +322,18 @@ module tans_encoder #(
                 end
 
                 S_NORM_MARK: begin
-                    freq[cur_max_sym]          <= 16'd2;
+                    // base_tbl assigned HERE, in descending-count
+                    // extraction order, matching fse_codec.c exactly --
+                    // see the note in S_NORM_INIT above.
+                    base_tbl[cur_max_sym]      <= running_sum;
                     freq_assigned[cur_max_sym] <= 1'b1;
+                    if (bump_remaining != 0) begin
+                        freq[cur_max_sym] <= 16'd2;
+                        running_sum       <= running_sum + 16'd2;
+                        bump_remaining    <= bump_remaining - 1;
+                    end else begin
+                        running_sum       <= running_sum + 16'd1; // freq already 1
+                    end
                     remaining_ctr <= remaining_ctr - 1;
                     scan_sym      <= '0;
                     cur_max_count <= '0;
@@ -295,6 +364,8 @@ module tans_encoder #(
                 S_SER_INIT: begin
                     out_init_state <= enc_state; // final backward-pass state = state_0
                     ser_i          <= '0;
+                    ser_done       <= 1'b0;
+                    final_flush_pending <= 1'b0;
                     out_shreg      <= '0;
                     out_bits_in_shreg <= '0;
                     byte_ctr       <= '0;
@@ -304,8 +375,54 @@ module tans_encoder #(
                     // Pack result_bits[ser_i] (result_nbbits[ser_i] wide)
                     // into out_shreg LSB-first; flush a byte whenever 8
                     // bits are ready. Matches fse_codec.c's BitWriter
-                    // exactly (LSB-first within byte, bytes in order).
-                    if (!out_valid || out_ready) begin
+                    // exactly (LSB-first within byte, bytes in order,
+                    // total length rounded UP to (bitPos+7)/8 bytes --
+                    // i.e. ANY nonzero leftover bit count gets its own
+                    // final padded byte, even one that follows a cycle
+                    // that ALSO flushed a full, unrelated byte).
+                    //
+                    // BUG FIX (extra/runaway bytes): see the historical
+                    // note below on `ser_done` -- the old exit condition
+                    // (out_bits_in_shreg==0) could never become true
+                    // once the leftover-flush branch stopped clearing
+                    // it, and ser_i never advances past its terminal
+                    // value, so the FSM re-executed this body forever,
+                    // re-merging the last token's bits again each cycle.
+                    // Fixed by latching `ser_done` once the last token's
+                    // byte(s) are queued and gating the merge on
+                    // `!ser_done`.
+                    //
+                    // BUG FIX (missing final byte): a SEPARATE, distinct
+                    // gap -- fixing the above revealed it -- is that the
+                    // last-token handling only ever checked for a
+                    // leftover-needs-padding byte in the merged_cnt<8
+                    // case. If merged_cnt>=8 on the last token (the
+                    // outer branch below flushes ONE full byte this same
+                    // cycle) but merged_cnt-8 is ALSO nonzero, there is
+                    // a second, separate trailing byte still owed -- and
+                    // a single out_byte register can't emit two bytes in
+                    // one cycle. The original code silently dropped this
+                    // second byte outright (out_last was simply set to
+                    // 1 on whatever byte the outer branch had just
+                    // flushed). This test tile hits exactly that case:
+                    // RTL emitted 6 of the golden 7 bytes, byte-exact,
+                    // missing only the trailing all-zero pad byte.
+                    // Fixed with an explicit extra cycle
+                    // (`final_flush_pending`) that flushes out_shreg
+                    // (already correctly holding merged[15:8] from the
+                    // outer branch's own assignment) as its own padded
+                    // final byte, one cycle after the normal one.
+                    if (final_flush_pending) begin
+                        if (!out_valid || out_ready) begin
+                            out_byte  <= out_shreg;
+                            out_valid <= 1'b1;
+                            out_last  <= 1'b1;
+                            byte_ctr  <= byte_ctr + 1;
+                            out_total_bytes <= 32'(byte_ctr) + 1;
+                            final_flush_pending <= 1'b0;
+                            ser_done  <= 1'b1;
+                        end
+                    end else if (!ser_done && (!out_valid || out_ready)) begin
                         merged     = {8'd0, out_shreg} | (result_bits[ser_i] << out_bits_in_shreg);
                         merged_cnt = out_bits_in_shreg + result_nbbits[ser_i];
 
@@ -322,22 +439,35 @@ module tans_encoder #(
                         end
 
                         if (ser_i == n_tokens_q - 1) begin
-                            // last token processed -- if leftover bits
-                            // remain unflushed, flush a final padded byte
-                            if (merged_cnt < 8 && merged_cnt != 0) begin
+                            if (merged_cnt >= 8) begin
+                                if (merged_cnt - 8 != 0) begin
+                                    // this cycle's outer branch already
+                                    // flushes one full byte (merged[7:0]);
+                                    // the true final, padded byte
+                                    // (merged[15:8], via out_shreg) needs
+                                    // its own cycle -- see above.
+                                    final_flush_pending <= 1'b1;
+                                end else begin
+                                    ser_done <= 1'b1;
+                                    out_last <= 1'b1;
+                                    out_total_bytes <= 32'(byte_ctr) + 1;
+                                end
+                            end else if (merged_cnt != 0) begin
                                 out_byte  <= merged[7:0];
                                 out_valid <= 1'b1;
                                 out_last  <= 1'b1;
                                 byte_ctr  <= byte_ctr + 1;
+                                ser_done  <= 1'b1;
+                                out_total_bytes <= 32'(byte_ctr) + 1;
                             end else begin
-                                out_last <= (merged_cnt >= 8);
+                                ser_done <= 1'b1;
+                                out_last <= 1'b1;
+                                out_total_bytes <= 32'(byte_ctr);
                             end
-                            out_total_bytes <= 32'(byte_ctr) + (merged_cnt >= 8 ? 1 : 0) +
-                                                ((merged_cnt < 8 && merged_cnt != 0) ? 1 : 0);
                         end else begin
                             ser_i <= ser_i + 1;
                         end
-                    end else if (out_valid && out_ready) begin
+                    end else if (ser_done && out_valid && out_ready) begin
                         out_valid <= 1'b0;
                     end
                 end
