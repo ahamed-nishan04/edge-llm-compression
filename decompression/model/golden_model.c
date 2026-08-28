@@ -1,3 +1,21 @@
+/* =============================================================================
+ * golden_model.c
+ * Bit-exact-ish C reference for the decompression pipeline stages, used to:
+ *   1. Generate known-good (compressed_in, decompressed_out) test vectors
+ *      for the RTL testbench.
+ *   2. Sanity check each stage's algorithm independent of RTL timing.
+ *
+ * This is a FUNCTIONAL model (simplified LZ77 + a toy range/table entropy
+ * stage), NOT a bit-exact Zstd/tANS implementation -- for real bring-up you
+ * should instead point the testbench at actual `zstd --ultra -22` output
+ * decoded with a reference tANS decoder (e.g. adapt FiniteStateEntropy from
+ * the Zstd repo) so RTL is verified against the real format, not a stand-in.
+ * This file exists to unblock RTL structural testing before that's wired up.
+ *
+ * Stages modeled, matching the RTL pipeline order:
+ *   entropy_decode_toy() -> lz_reconstruct() -> desparse_2_4() -> dequant()
+ * ============================================================================= */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -9,12 +27,15 @@
 
 typedef enum { QUANT_INT8 = 0, QUANT_NF4 = 1, QUANT_AWQ_INT4 = 2 } quant_mode_t;
 
+/* ---- Toy entropy stage: literal-only passthrough (placeholder for tANS) ---- */
 static void entropy_decode_toy(const uint8_t *comp, int comp_len,
                                 uint8_t *literals, int *lit_len) {
     memcpy(literals, comp, comp_len);
     *lit_len = comp_len;
 }
 
+/* ---- LZ77 reconstruction: token stream (0x00 len offset_hi offset_lo = match,
+ *      else literal byte) against dictionary + in-tile history ---- */
 static int lz_reconstruct(const uint8_t *tokens, int tok_len,
                            const uint8_t *dict, int dict_len,
                            uint8_t *out) {
@@ -42,6 +63,7 @@ static int lz_reconstruct(const uint8_t *tokens, int tok_len,
     return op;
 }
 
+/* ---- 2:4 structured sparsity expansion: 4-bit idx + 2 nonzero bytes per group ---- */
 static int desparse_2_4(const uint8_t *in, int in_len, uint8_t *out) {
     int op = 0, ip = 0;
     while (ip + 2 < in_len) {
@@ -61,6 +83,7 @@ static int desparse_2_4(const uint8_t *in, int in_len, uint8_t *out) {
     return op;
 }
 
+/* ---- Dequantize: INT8 affine / NF4 LUT / AWQ-INT4 affine ---- */
 static const float nf4_lut[16] = {
     -1.0f, -0.6962f, -0.5251f, -0.3949f, -0.2844f, -0.1848f, -0.0911f, -0.0f,
      0.0f,  0.0796f,  0.1610f,  0.2461f,  0.3379f,  0.4407f,  0.5626f,  0.7230f
@@ -78,7 +101,7 @@ static int dequant(const uint8_t *in, int in_len, quant_mode_t mode,
         } else if (mode == QUANT_NF4) {
             out[op++] = nf4_lut[(in[i] >> 4) & 0xF] * s;
             out[op++] = nf4_lut[in[i] & 0xF] * s;
-        } else { 
+        } else { /* AWQ_INT4 */
             out[op++] = (((in[i] >> 4) & 0xF) - z) * s;
             out[op++] = ((in[i] & 0xF) - z) * s;
         }
@@ -86,6 +109,7 @@ static int dequant(const uint8_t *in, int in_len, quant_mode_t mode,
     return op;
 }
 
+/* ---- End-to-end pipeline, mirrors RTL stage order ---- */
 int decompress_tile(const uint8_t *comp, int comp_len,
                      const uint8_t *dict, int dict_len,
                      int desparse_en, quant_mode_t mode,
@@ -112,6 +136,7 @@ int decompress_tile(const uint8_t *comp, int comp_len,
 
 #ifdef GOLDEN_MODEL_MAIN
 int main(void) {
+    /* Minimal smoke test: literal-only tile, no LZ matches, INT8 dequant */
     uint8_t comp[16];
     for (int i = 0; i < 16; i++) comp[i] = i * 4;
     float scale[TILE_SIZE_BYTES / GROUP_SIZE];

@@ -1,3 +1,4 @@
+```systemverilog
 // =============================================================================
 // axi_dma_if.sv
 // Minimal AXI-512 read master. Fetches a compressed tile starting at src_addr,
@@ -19,6 +20,16 @@
 // accepted beat -- avoiding the classic off-by-one double-count that a
 // fetch-ahead register introduces when its "already latched" byte and the
 // occupancy counter disagree about whether that byte has been "consumed".
+//
+// Write-side hardening: acceptance of an AXI beat is gated not just on
+// "not completely full" but on there being full BEAT_BYTES worth of
+// headroom, so a beat can never be accepted when it would push occupancy
+// past FIFO_DEPTH (which would otherwise silently wrap wr_idx and
+// overwrite not-yet-consumed bytes -- the "beat vs. FIFO-depth mismatch"
+// class of bug). Per-byte write addressing is also computed with a wide
+// (32-bit) intermediate before the modulo, so it can't be silently
+// truncated when clog2(FIFO_DEPTH) happens to be narrower than what's
+// needed to represent BEAT_BYTES-1.
 // =============================================================================
 
 module axi_dma_if #(
@@ -64,6 +75,15 @@ module axi_dma_if #(
     localparam int PTR_W       = $clog2(FIFO_DEPTH) + 1; // +1 headroom bit so
                                                             // full vs empty are
                                                             // unambiguous
+
+    // Maximum occupancy at which one more full beat may still be safely
+    // accepted without overflowing the FIFO's exact byte-count. Clamped
+    // at 0 so a (mis)configuration with FIFO_DEPTH < BEAT_BYTES doesn't
+    // underflow into a huge value and permanently deassert rready --
+    // that configuration is documented as unsupported (narrow the bus or
+    // widen the FIFO instead), not something this gate needs to paper
+    // over.
+    localparam int HEADROOM_LIMIT = (FIFO_DEPTH > BEAT_BYTES) ? (FIFO_DEPTH - BEAT_BYTES) : 0;
 
     typedef enum logic [1:0] {IDLE, ADDR, DATA, DRAIN} state_e;
     state_e state, state_n;
@@ -120,7 +140,12 @@ module axi_dma_if #(
     assign m_axi_arlen  = BURST_LEN - 1;      // AXI ARLEN is beats-1
     assign m_axi_arsize = $clog2(BEAT_BYTES); // full-width beats
     assign m_axi_arid   = '0;
-    assign m_axi_rready = (state == DATA) && !fifo_full;
+
+    // Accept a beat only when there's guaranteed room for a *full* beat
+    // -- not merely "not completely full" -- so occupancy can never be
+    // pushed past FIFO_DEPTH and wr_idx can never silently wrap onto
+    // not-yet-consumed bytes.
+    assign m_axi_rready = (state == DATA) && (occupancy <= HEADROOM_LIMIT[PTR_W-1:0]);
 
     // ---------------- FIFO write side: unpack each beat into bytes ----
     logic wr_fire;
@@ -132,9 +157,13 @@ module axi_dma_if #(
             wr_idx <= '0;
         end else if (wr_fire) begin
             for (i = 0; i < BEAT_BYTES; i++) begin
-                fifo_mem[(wr_idx + i[$clog2(FIFO_DEPTH)-1:0]) % FIFO_DEPTH] <= rdata_bytes[i];
+                // Wide (32-bit) intermediate before the modulo -- avoids
+                // silently truncating the sum when clog2(FIFO_DEPTH) is
+                // narrower than needed to hold (BEAT_BYTES-1) prior to
+                // reduction.
+                fifo_mem[(32'(wr_idx) + i) % FIFO_DEPTH] <= rdata_bytes[i];
             end
-            wr_idx <= (wr_idx + BEAT_BYTES[$clog2(FIFO_DEPTH)-1:0]) % FIFO_DEPTH;
+            wr_idx <= (32'(wr_idx) + BEAT_BYTES) % FIFO_DEPTH;
         end
     end
 
@@ -170,42 +199,3 @@ module axi_dma_if #(
     // ---------------- Tile-boundary tracking: count bytes actually
     // delivered out of this port for the CURRENT tile (kept for
     // out_tile_last below; NOTE this output is currently unused
-    // downstream, since tans_decoder.sv tracks its own completion by
-    // decoded symbol count rather than input byte count -- see that
-    // file's header for why byte-count-based completion isn't valid for
-    // real variable-length entropy coding) ----------------
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            bytes_delivered <= '0;
-        end else begin
-            if (state == IDLE && start) begin
-                bytes_delivered <= '0;
-            end else if (pop) begin
-                bytes_delivered <= bytes_delivered + 1;
-            end
-        end
-    end
-
-    // `done` means "the AXI fetch itself has completed" (all requested
-    // bytes are resident in the FIFO) -- NOT "every byte has been popped
-    // by the consumer". Those are different things: a real entropy
-    // decoder legitimately stops pulling bytes once it has decoded all
-    // the symbols it needs, which can be fewer bytes than a
-    // conservatively-sized/padded burst. Waiting for full drain here
-    // (the old behavior) meant `done` would never fire whenever the
-    // decoder didn't need the tile's full padded burst -- exactly the
-    // case for a genuinely compressed (smaller-than-tile) payload. Full
-    // pipeline drain is the scheduler's separate `pipe_tile_done` check
-    // (via out_tile_last from the FINAL stage), not this module's job.
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            done <= 1'b0;
-        end else begin
-            done <= (state == DATA) && m_axi_rvalid && m_axi_rlast && m_axi_rready;
-        end
-    end
-
-    assign out_tile_id   = tile_id_q;
-    assign out_tile_last = pop && (bytes_delivered + 1 == FIFO_DEPTH);
-
-endmodule

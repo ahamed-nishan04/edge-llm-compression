@@ -1,3 +1,17 @@
+// =============================================================================
+// tile_scheduler.sv
+// Drives the tile-wise JIT decompression loop: for tile_id in
+// [0, num_tiles_this_run), kick off a DMA fetch, wait for the pipeline to
+// drain that tile to the output port, advance. Manages double/triple
+// buffering so DMA fetch of tile N+1 can overlap decode/output of tile N
+// (bounds SRAM residency to NUM_DOUBLE_BUFS * TILE_SIZE_BYTES, per your
+// tile-wise JIT design decision).
+//
+// This is the module where TILE_SIZE_BYTES / NUM_TILES actually change
+// runtime behavior (address stride, loop trip count) -- everything else
+// downstream just processes whatever byte stream it's handed.
+// =============================================================================
+
 module tile_scheduler #(
     parameter int NUM_TILES        = 64,
     parameter int NUM_DOUBLE_BUFS  = 2,
@@ -10,7 +24,7 @@ module tile_scheduler #(
     input  logic                          start,
     input  logic [AXI_ADDR_WIDTH-1:0]     src_base_addr,
     input  logic [AXI_ADDR_WIDTH-1:0]     dst_base_addr,
-    input  logic [$clog2(NUM_TILES+1)-1:0]  num_tiles_this_run, 
+    input  logic [$clog2(NUM_TILES+1)-1:0]  num_tiles_this_run, // COUNT, range 1..NUM_TILES
 
     output logic                          busy,
     output logic                          done,
@@ -23,6 +37,19 @@ module tile_scheduler #(
     output logic [$clog2(NUM_TILES)-1:0]  dma_tile_id,
     input  logic                          dma_done,
 
+    // Asserted for one cycle when the LAST pipeline stage (dequant) has
+    // delivered the final byte/element of the current tile (out_valid &&
+    // out_ready && out_tile_last at the top level). We gate advancing to
+    // the next tile's DMA fetch on THIS, not just dma_done -- dma_done only
+    // means the compressed bytes have been pulled out of DRAM into the
+    // shared compressed FIFO; the entropy/LZ/desparse/dequant chain is
+    // still draining that FIFO's contents for several more cycles after.
+    // Since there is only one compressed FIFO instance (no ping-pong on
+    // the compressed side yet), starting the next fetch before the
+    // pipeline finishes reading the current tile's bytes would let new
+    // beats overwrite still-unread FIFO entries. If you add a real
+    // ping-ponged compressed-side buffer, dma_done becomes sufficient here
+    // again and pipe_tile_done only needs to gate buf_swap_ack.
     input  logic                          pipe_tile_done,
 
     output logic [$clog2(NUM_DOUBLE_BUFS)-1:0] active_wr_buf,
@@ -90,6 +117,8 @@ module tile_scheduler #(
 
                 S_ISSUE_FETCH: begin
                     dma_start    <= 1'b1;
+                    // Fixed-stride tile addressing: this is where TILE_SIZE_BYTES
+                    // directly drives runtime address generation.
                     dma_src_addr <= src_base_addr + (tile_ctr * TILE_SIZE_BYTES);
                     dma_tile_id  <= tile_ctr;
                 end
@@ -113,7 +142,7 @@ module tile_scheduler #(
 
                 S_ERROR: begin
                     error      <= 1'b1;
-                    error_code <= 4'd1; 
+                    error_code <= 4'd1; // 1 = num_tiles_this_run == 0
                 end
 
                 default: ;
