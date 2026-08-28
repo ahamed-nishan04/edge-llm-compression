@@ -96,10 +96,10 @@ Every knob you asked for is a `parameter` on `zstd_decomp_top`:
 
 ```systemverilog
 zstd_decomp_top #(
-    .TILE_SIZE_BYTES (4096),   // decompressed bytes per tile
-    .NUM_TILES       (64),     // max tiles this instance can loop over
-    .NUM_DOUBLE_BUFS (2),      // buffering depth for fetch/decode overlap
-    .DICT_DEPTH_BYTES(32768)   // per-dictionary size (weights/KV/FFN)
+    .TILE_SIZE_BYTES (4096),
+    .NUM_TILES       (64),
+    .NUM_DOUBLE_BUFS (2),
+    .DICT_DEPTH_BYTES(32768)
 ) u_decomp ( ... );
 ```
 

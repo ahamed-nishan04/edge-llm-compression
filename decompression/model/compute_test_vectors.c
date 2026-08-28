@@ -26,15 +26,12 @@ int main(void) {
     printf("num_symbols = %d\n", n);
     printf("total compressed bytes = %d\n", outBytes);
 
-    /* ---- Now run LZ reconstruct + desparse + dequant in software to get
-     * the expected final output ---- */
     int decoded[64];
     fse_decode(&t, compressed, initState, decoded, n);
 
     printf("\n// ==== decoded symbols ====\n");
     for (int i = 0; i < n; i++) printf("sym[%d] = 0x%03x\n", i, decoded[i]);
 
-    /* LZ reconstruct */
     uint8_t lz_out[64];
     int lz_len = 0;
     for (int i = 0; i < n; ) {
@@ -54,7 +51,6 @@ int main(void) {
     printf("\n// ==== LZ-reconstructed bytes (%d) ====\n", lz_len);
     for (int i = 0; i < lz_len; i++) printf("lz_out[%d] = 0x%02x\n", i, lz_out[i]);
 
-    /* Desparse: 2:4 groups of {idx, v0, v1} -> 4 bytes each */
     uint8_t ds_out[64];
     int ds_len = 0;
     for (int g = 0; g < lz_len; g += 3) {
@@ -73,7 +69,6 @@ int main(void) {
     printf("\n// ==== Desparsed bytes (%d) ====\n", ds_len);
     for (int i = 0; i < ds_len; i++) printf("ds_out[%d] = 0x%02x\n", i, ds_out[i]);
 
-    /* Dequant INT8, scale=1, zero=0 (identity, easiest to check) */
     printf("\n// ==== Dequantized (INT8, scale=1, zero=0) - expect == ds_out ====\n");
     for (int i = 0; i < ds_len; i++) printf("out[%d] = %d (0x%02x)\n", i, ds_out[i], ds_out[i]);
 

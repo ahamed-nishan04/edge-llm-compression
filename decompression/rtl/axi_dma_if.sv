@@ -1,25 +1,3 @@
-// =============================================================================
-// axi_dma_if.sv
-// Minimal AXI-512 read master. Fetches a compressed tile starting at src_addr,
-// pushes it into an internal FIFO, and streams bytes out to the entropy
-// decoder at 1 byte/cycle (decoder is the natural-rate consumer here; widen
-// out_byte to a bus if you want to feed a wider tANS decode front end).
-//
-// NOTE: burst length is fixed conservatively at max compressed tile size;
-// in a real implementation you'd carry a per-tile compressed-length field
-// (written by the encoder / host) so you don't over-fetch. That length input
-// is exposed here as `comp_len_bytes` for you to wire up from a tile
-// metadata table (recommended: small SRAM indexed by tile_id, populated at
-// compress time).
-//
-// FIFO implementation note: uses a combinational read (out_byte reflects
-// fifo_mem[rd_ptr] directly, out_valid = occupancy>0) rather than a
-// registered fetch-ahead stage. This keeps occupancy accounting exact --
-// exactly one decrement per accepted pop, exactly one increment per
-// accepted beat -- avoiding the classic off-by-one double-count that a
-// fetch-ahead register introduces when its "already latched" byte and the
-// occupancy counter disagree about whether that byte has been "consumed".
-// =============================================================================
 
 module axi_dma_if #(
     parameter int AXI_DATA_WIDTH = 512,
@@ -36,8 +14,6 @@ module axi_dma_if #(
     input  logic [$clog2(NUM_TILES)-1:0]  tile_id,
     output logic                          done,
 
-    // Optional: per-tile compressed length in bytes (metadata-table driven).
-    // Tie to '1 (max) if you don't have a metadata table yet.
     input  logic [$clog2(FIFO_DEPTH)-1:0] comp_len_bytes = '1,
 
     output logic [AXI_ADDR_WIDTH-1:0]     m_axi_araddr,
@@ -60,18 +36,15 @@ module axi_dma_if #(
 );
 
     localparam int BEAT_BYTES  = AXI_DATA_WIDTH / 8;
-    localparam int BURST_LEN   = (FIFO_DEPTH + BEAT_BYTES - 1) / BEAT_BYTES; // in beats
-    localparam int PTR_W       = $clog2(FIFO_DEPTH) + 1; // +1 headroom bit so
-                                                            // full vs empty are
-                                                            // unambiguous
+    localparam int BURST_LEN   = (FIFO_DEPTH + BEAT_BYTES - 1) / BEAT_BYTES;
+    localparam int PTR_W       = $clog2(FIFO_DEPTH) + 1;
 
     typedef enum logic [1:0] {IDLE, ADDR, DATA, DRAIN} state_e;
     state_e state, state_n;
 
-    // ---------------- Compressed-byte FIFO ----------------
     logic [7:0] fifo_mem [0:FIFO_DEPTH-1];
-    logic [$clog2(FIFO_DEPTH)-1:0] wr_idx, rd_idx;      // wrapped memory indices
-    logic [PTR_W-1:0]              occupancy;            // exact byte count resident
+    logic [$clog2(FIFO_DEPTH)-1:0] wr_idx, rd_idx;
+    logic [PTR_W-1:0]              occupancy;
     logic fifo_empty, fifo_full;
 
     assign fifo_empty = (occupancy == 0);
@@ -81,12 +54,8 @@ module axi_dma_if #(
     logic [BEAT_BYTES-1:0][7:0]   rdata_bytes;
     assign rdata_bytes = m_axi_rdata;
 
-    // Tile-boundary tracking (declared here, before first use in the FSM
-    // below): counts bytes actually popped out of this port for the
-    // CURRENT tile, independent of FIFO occupancy bookkeeping.
     logic [PTR_W-1:0] bytes_delivered;
 
-    // ---------------- FSM ----------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) state <= IDLE;
         else        state <= state_n;
@@ -117,12 +86,11 @@ module axi_dma_if #(
         end
     end
 
-    assign m_axi_arlen  = BURST_LEN - 1;      // AXI ARLEN is beats-1
-    assign m_axi_arsize = $clog2(BEAT_BYTES); // full-width beats
+    assign m_axi_arlen  = BURST_LEN - 1;
+    assign m_axi_arsize = $clog2(BEAT_BYTES);
     assign m_axi_arid   = '0;
     assign m_axi_rready = (state == DATA) && !fifo_full;
 
-    // ---------------- FIFO write side: unpack each beat into bytes ----
     logic wr_fire;
     assign wr_fire = m_axi_rvalid && m_axi_rready;
 
@@ -138,7 +106,6 @@ module axi_dma_if #(
         end
     end
 
-    // ---------------- FIFO read side: combinational pop ----------------
     logic pop;
     assign out_byte  = fifo_mem[rd_idx];
     assign out_valid = !fifo_empty;
@@ -152,8 +119,6 @@ module axi_dma_if #(
         end
     end
 
-    // ---------------- Occupancy: exactly one +BEAT_BYTES per accepted
-    // beat, exactly one -1 per accepted pop, both can fire same cycle ----
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             occupancy <= '0;
@@ -167,13 +132,6 @@ module axi_dma_if #(
         end
     end
 
-    // ---------------- Tile-boundary tracking: count bytes actually
-    // delivered out of this port for the CURRENT tile (kept for
-    // out_tile_last below; NOTE this output is currently unused
-    // downstream, since tans_decoder.sv tracks its own completion by
-    // decoded symbol count rather than input byte count -- see that
-    // file's header for why byte-count-based completion isn't valid for
-    // real variable-length entropy coding) ----------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             bytes_delivered <= '0;
@@ -186,17 +144,6 @@ module axi_dma_if #(
         end
     end
 
-    // `done` means "the AXI fetch itself has completed" (all requested
-    // bytes are resident in the FIFO) -- NOT "every byte has been popped
-    // by the consumer". Those are different things: a real entropy
-    // decoder legitimately stops pulling bytes once it has decoded all
-    // the symbols it needs, which can be fewer bytes than a
-    // conservatively-sized/padded burst. Waiting for full drain here
-    // (the old behavior) meant `done` would never fire whenever the
-    // decoder didn't need the tile's full padded burst -- exactly the
-    // case for a genuinely compressed (smaller-than-tile) payload. Full
-    // pipeline drain is the scheduler's separate `pipe_tile_done` check
-    // (via out_tile_last from the FINAL stage), not this module's job.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             done <= 1'b0;

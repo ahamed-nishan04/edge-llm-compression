@@ -1,54 +1,14 @@
 `timescale 1ns/1ps
 
-// =============================================================================
-// tb_zstd_decomp_top.sv -- REAL single-tile FSE round-trip test.
-//
-// Unlike the earlier control-flow smoke test (literal-passthrough,
-// nb_bits=0 everywhere, no real entropy coding exercised), this drives
-// the pipeline with an ACTUAL FSE-encoded tile from
-// model/compute_test_vectors.c (real table, real variable bit-lengths,
-// a real ESCAPE-coded LZ match), and checks the LZ-reconstructed output
-// bytes against that golden model's expected values -- not just "did it
-// finish without error".
-//
-// `include`s generated_stimulus.svh, regenerated fresh by
-// run_zstd_chia_loop.py's regenerate_golden_vectors() +
-// write_stimulus_include() before every LLM iteration -- so this test
-// always checks against the CURRENT golden-model output, not a frozen
-// snapshot.
-// =============================================================================
-
 module tb_zstd_decomp_top;
 
     `include "generated_stimulus.svh"
 
-    localparam int TILE_SIZE_BYTES = GEN_TILE_SIZE_BYTES; // 12 for the current vectors
-    // NOTE: 2, not 1, and this is a WORKAROUND rather than a design choice.
-    // With NUM_TILES=1, $clog2(NUM_TILES) evaluates to 0, so every
-    // `logic [$clog2(NUM_TILES)-1:0]` in the RTL and in this file becomes a
-    // [-1:0] vector, and desparse_unit.sv's `{TID_W{1'b0}}` becomes a
-    // zero-repeat concatenation -- which iverilog rejects outright
-    // ("Concatenation repeat may not be zero in this context"), so the
-    // design does not elaborate at all. That pattern appears at 24 sites
-    // across rtl/ and tb/. The proper fix is a floored width localparam,
-    //     localparam int TID_W = (NUM_TILES <= 1) ? 1 : $clog2(NUM_TILES);
-    // applied at all of them. Until that is done, this test instantiates
-    // capacity for 2 tiles and runs only 1 (see num_tiles_this_run below).
+    localparam int TILE_SIZE_BYTES = GEN_TILE_SIZE_BYTES;
+
     localparam int NUM_TILES       = 2;
     localparam int NUM_DOUBLE_BUFS = 2;
-    // NOTE: AXI_DATA_WIDTH deliberately narrow (32-bit, 4-byte beats) for
-    // this small real-tile test. axi_dma_if.sv's compressed-side FIFO is
-    // sized to COMP_FIFO_DEPTH=TILE_SIZE_BYTES, and its beat-unpack logic
-    // writes an ENTIRE beat into that FIFO in one clock edge -- with a
-    // 512-bit (64-byte) bus and a 12-byte tile, a single beat is more
-    // than 5x the FIFO's depth, so the beat wraps around and corrupts
-    // itself within that same write, and the occupancy counter overflows
-    // silently back toward 0. A real design would size its bus width (or
-    // its minimum tile size) so beats never exceed a tile's compressed
-    // FIFO depth in the first place; this test picks the narrow-bus side
-    // of that constraint since the tile size is fixed by the golden
-    // vectors. Production tiles (hundreds+ bytes) don't hit this at
-    // AXI_DATA_WIDTH=512.
+
     localparam int AXI_DATA_WIDTH  = 32;
     localparam int AXI_ADDR_WIDTH  = 40;
 
@@ -132,8 +92,6 @@ module tb_zstd_decomp_top;
         .num_symbols_this_tile(num_symbols_this_tile)
     );
 
-    // ---------------- AXI memory model: holds the REAL compressed bytes
-    // from GEN_COMP_BYTES at address 0 (not a sequential ramp) ----------
     logic [7:0] mem [0:(1<<14)-1];
     initial begin
         for (int i = 0; i < (1<<14); i++) mem[i] = 8'h00;
@@ -184,13 +142,6 @@ module tb_zstd_decomp_top;
 
     assign out_ready = 1'b1;
 
-    // ---------------------------------------------------------
-    // LZ-RECONSTRUCTION SCOREBOARD
-    // Checks out_data against GEN_EXPECTED_LZ_BYTES (the real golden
-    // model's LZ-reconstructed bytes), through dequant in INT8 identity
-    // mode (scale=1, zero=0) with desparse bypassed -- so out_data's low
-    // byte should equal the expected LZ byte unchanged.
-    // ---------------------------------------------------------
     int check_idx = 0;
     logic [7:0]  expected_byte;
     logic [31:0] expected_dequant;
@@ -199,7 +150,7 @@ module tb_zstd_decomp_top;
         if (out_valid && out_ready) begin
             if (check_idx < GEN_TILE_SIZE_BYTES) begin
                 expected_byte    = GEN_EXPECTED_LZ_BYTES[check_idx];
-                expected_dequant = {2{expected_byte, 8'h00}}; // scale=0x0100 (1.0), zero=0
+                expected_dequant = {2{expected_byte, 8'h00}};
 
                 if (out_data[31:0] !== expected_dequant) begin
                     $display("[SCOREBOARD FAIL] Offset %0d: Expected 32'h%h, Got 32'h%h",
@@ -218,17 +169,11 @@ module tb_zstd_decomp_top;
         scoreboard_error = 0;
         src_base_addr = 0;
         dst_base_addr = 0;
-        // 1, NOT NUM_TILES: the instance has capacity for 2 tiles (see the
-        // note above) but the golden vectors only describe one. Driving
-        // NUM_TILES here makes the scheduler fetch a second tile that does
-        // not exist and hang. num_tiles_this_run is a runtime port precisely
-        // so capacity and actual work can differ.
+
         num_tiles_this_run = 1;
         dict_sel = 2'd0;
-        quant_mode = 2'd0; // QUANT_INT8
-        desparse_en = 1'b0; // this test data isn't real 2:4-sparse-encoded;
-                             // bypass, same convention as the earlier
-                             // control-flow smoke test used
+        quant_mode = 2'd0;
+        desparse_en = 1'b0;
 
         dict_wr_en = 0; dict_wr_sel = 0; dict_wr_addr = 0; dict_wr_data = 0;
         table_wr_en = 0; table_wr_addr = 0; table_wr_symbol = 0;
@@ -241,7 +186,6 @@ module tb_zstd_decomp_top;
         rst_n = 1;
         repeat (2) @(posedge clk);
 
-        // Program the REAL FSE decode table from the golden model
         table_wr_en = 1;
         for (int i = 0; i < GEN_NUM_TABLE_ENTRIES; i++) begin
             table_wr_addr          = GEN_TABLE_ADDR[i];
@@ -253,8 +197,6 @@ module tb_zstd_decomp_top;
         table_wr_en = 0;
         @(posedge clk);
 
-        // Dequant scale=1.0 (Q8.8: 0x0100), zero=0, identity transform so
-        // out_data should equal the LZ-reconstructed bytes unchanged.
         for (int g = 0; g < (TILE_SIZE_BYTES/128 == 0 ? 1 : TILE_SIZE_BYTES/128); g++) begin
             dut.u_dequant.scale_mem[g] = 16'h0100;
             dut.u_dequant.zero_mem[g]  = 8'h00;
@@ -280,7 +222,6 @@ module tb_zstd_decomp_top;
         $finish;
     end
 
-    // Debug trace
     logic [2:0] sched_st_prev_dbg;
     initial begin
         sched_st_prev_dbg = 3'b111;

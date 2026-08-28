@@ -1,15 +1,3 @@
-// ============================================================
-// generated_stimulus.svh -- AUTO-GENERATED, DO NOT EDIT
-// Source: model/compute_test_vectors.c (via gen_stimulus.py)
-// Regenerate: python3 gen_stimulus.py
-//
-// The array fills below are `initial` blocks. iverilog runs
-// initial blocks in source order, and this file is included at
-// the TOP of the tb module, so these run before the tb's own
-// time-0 AXI `mem` init that reads GEN_COMP_BYTES. Keep the
-// `include` first in the module -- moving it below the mem
-// initial block would read X's.
-// ============================================================
 
 localparam int GEN_TILE_SIZE_BYTES   = 12;
 localparam int GEN_NUM_COMP_BYTES    = 5;
@@ -17,7 +5,6 @@ localparam int GEN_NUM_TABLE_ENTRIES = 16;
 localparam logic [31:0] GEN_INIT_STATE  = 32'd1;
 localparam logic [31:0] GEN_NUM_SYMBOLS = 32'd10;
 
-// ---- FSE decode table preload ----
 logic [11:0] GEN_TABLE_ADDR [0:15];
 initial begin
     GEN_TABLE_ADDR[0] = 12'd0; GEN_TABLE_ADDR[1] = 12'd1; GEN_TABLE_ADDR[2] = 12'd2; GEN_TABLE_ADDR[3] = 12'd3; GEN_TABLE_ADDR[4] = 12'd4; GEN_TABLE_ADDR[5] = 12'd5;
@@ -43,13 +30,11 @@ initial begin
     GEN_TABLE_NEWSTATE[12] = 12'd8; GEN_TABLE_NEWSTATE[13] = 12'd10; GEN_TABLE_NEWSTATE[14] = 12'd12; GEN_TABLE_NEWSTATE[15] = 12'd14;
 end
 
-// ---- compressed bitstream (loaded into AXI memory model) ----
 logic [7:0] GEN_COMP_BYTES [0:4];
 initial begin
     GEN_COMP_BYTES[0] = 8'h76; GEN_COMP_BYTES[1] = 8'h43; GEN_COMP_BYTES[2] = 8'h85; GEN_COMP_BYTES[3] = 8'h44; GEN_COMP_BYTES[4] = 8'h00;
 end
 
-// ---- expected LZ-reconstructed bytes (scoreboard target) ----
 logic [7:0] GEN_EXPECTED_LZ_BYTES [0:11];
 initial begin
     GEN_EXPECTED_LZ_BYTES[0] = 8'h05; GEN_EXPECTED_LZ_BYTES[1] = 8'haa; GEN_EXPECTED_LZ_BYTES[2] = 8'hbb; GEN_EXPECTED_LZ_BYTES[3] = 8'h0a; GEN_EXPECTED_LZ_BYTES[4] = 8'h11; GEN_EXPECTED_LZ_BYTES[5] = 8'h22;

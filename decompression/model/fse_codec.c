@@ -1,40 +1,3 @@
-/* =============================================================================
- * fse_codec.c
- * A real (not toy) table-based ANS entropy coder: genuine encode/decode
- * round trip, not a literal-passthrough placeholder.
- *
- * Simplification versus full Zstd/FSE (chosen deliberately, documented so
- * it's an informed choice, not a hidden shortcut): every symbol's
- * normalized frequency is constrained to be a power of 2. This is still
- * genuine tANS (the decode table has the same (symbol, nbBits, newState)
- * shape a real FSE decode table has, and RTL decodes it exactly the same
- * way), but it lets the table be built and inverted for encoding with a
- * simple closed form instead of FSE's "spread" placement algorithm --
- * much less code, much lower risk of a subtle construction bug, at the
- * cost of not hitting fractional-bit optimal compression ratios. Real
- * bring-up against actual zstd output would replace build_table() with
- * the standard spread-based FSE table construction; the DECODE side
- * (and the RTL) would not need to change at all, since it only consumes
- * the (symbol, nbBits, newState) table regardless of how it was built.
- *
- * Core algorithm (standard tANS, derived and re-verified here explicitly
- * because getting the direction/ordering wrong silently breaks
- * correctness):
- *
- *   DECODE (forward through the symbol sequence):
- *     state = initial_state (transmitted)
- *     for i in 0..n-1:
- *       symbol[i]  = table[state].symbol
- *       nbBits     = table[state].nbBits
- *       bits       = read_bits(nbBits)      // from the stream, forward
- *       state      = table[state].newStateBase + bits
- *
- *   Because state at step i depends on bits consumed at step i, and the
- *   SYMBOL at step i is a function of state BEFORE those bits are known,
- *   encoding must run backward (last symbol first) to be able to solve
- *   for the state/bits that make forward decode reproduce the original
- *   sequence. See encode() below.
- * ============================================================================= */
 
 #include <stdio.h>
 #include <stdint.h>
@@ -53,12 +16,12 @@ typedef struct {
 
 typedef struct {
     int nbSymbols;
-    int symbolValue[MAX_SYMBOLS];   // the actual byte/escape value, in table order
-    int freq[MAX_SYMBOLS];          // power-of-2 frequency per symbol
-    int base[MAX_SYMBOLS];          // cumulative-frequency base (start state) per symbol
+    int symbolValue[MAX_SYMBOLS];
+    int freq[MAX_SYMBOLS];
+    int base[MAX_SYMBOLS];
     int tableLog;
     int tableSize;
-    DTableEntry table[MAX_TABLE];   // decode table, index by state
+    DTableEntry table[MAX_TABLE];
 } FseTable;
 
 static int ilog2(int x) {
@@ -67,8 +30,6 @@ static int ilog2(int x) {
     return r;
 }
 
-/* Build the decode table from a symbol/frequency spec. freq[] entries
- * MUST each be a power of 2, and MUST sum to exactly (1<<tableLog). */
 void fse_build_table(FseTable *t, const int *symbolValue, const int *freq,
                       int nbSymbols, int tableLog) {
     t->nbSymbols = nbSymbols;
@@ -88,7 +49,7 @@ void fse_build_table(FseTable *t, const int *symbolValue, const int *freq,
 
     for (int s = 0; s < nbSymbols; s++) {
         int f = t->freq[s];
-        int k = ilog2(f);              // f == 2^k, by construction
+        int k = ilog2(f);
         int nbBits = tableLog - k;
         for (int j = 0; j < f; j++) {
             int state = t->base[s] + j;
@@ -99,13 +60,10 @@ void fse_build_table(FseTable *t, const int *symbolValue, const int *freq,
     }
 }
 
-/* ---------------- Bit writer / reader (LSB-first within each byte, bytes
- * in increasing stream order -- our own convention, chosen for simplicity
- * since we control both ends; must match tans_decoder.sv exactly). ---- */
 typedef struct {
     uint8_t *buf;
     int      byteCap;
-    int      bitPos;    // next bit to write, 0 = LSB of buf[0]
+    int      bitPos;
 } BitWriter;
 
 static void bw_init(BitWriter *bw, uint8_t *buf, int byteCap) {
@@ -146,24 +104,15 @@ static uint32_t br_get_bits(BitReader *br, int nbBits) {
     return v;
 }
 
-/* ---------------- Encode: symbols[0..n-1] (original, forward order) ----
- * Processed BACKWARD internally; emits (nbBits,bits) pairs also in
- * backward order, then reverses them so the final bitstream has step 0's
- * bits first (matching forward decode order). Returns the INITIAL state
- * the decoder should start from (transmit this alongside the stream),
- * and fills `out` / `*outBytes` with the compressed bitstream. */
 int fse_encode(const FseTable *t, const int *symbols, int n,
                uint8_t *out, int outCap, int *outBytes) {
-    /* Look up each symbol's table index (base) and freq/nbBits by value */
+
     int idxOf[1024];
     memset(idxOf, -1, sizeof(idxOf));
     for (int s = 0; s < t->nbSymbols; s++) idxOf[t->symbolValue[s]] = s;
 
-    /* backward pass, recording (nbBits, bits) per step in i=n-1..0 order */
     int nbBitsArr[4096], bitsArr[4096];
-    int state = 0; /* arbitrary seed; must match what decoder is told as
-                       initial state only for the LAST computed value at
-                       i=0, so this seed itself is never transmitted */
+    int state = 0;
     for (int i = n - 1; i >= 0; i--) {
         int sym = symbols[i];
         int sIdx = idxOf[sym];
@@ -171,16 +120,16 @@ int fse_encode(const FseTable *t, const int *symbols, int n,
         int f = t->freq[sIdx];
         int k = ilog2(f);
         int nbBits = t->tableLog - k;
-        int j = state >> nbBits;          /* which occurrence of this symbol */
+        int j = state >> nbBits;
         int bits = state & ((1 << nbBits) - 1);
         assert(j < f && "encode state out of range for this symbol -- table/seed mismatch");
-        int newState = t->base[sIdx] + j;  /* this becomes state_i */
+        int newState = t->base[sIdx] + j;
 
         nbBitsArr[i] = nbBits;
         bitsArr[i]   = bits;
         state = newState;
     }
-    int initialState = state; /* this is state_0, what decode must start at */
+    int initialState = state;
 
     BitWriter bw;
     bw_init(&bw, out, outCap);
@@ -191,7 +140,6 @@ int fse_encode(const FseTable *t, const int *symbols, int n,
     return initialState;
 }
 
-/* ---------------- Decode: forward, exactly matching tans_decoder.sv ---- */
 void fse_decode(const FseTable *t, const uint8_t *in, int initialState,
                  int *symbolsOut, int n) {
     BitReader br;
@@ -208,8 +156,7 @@ void fse_decode(const FseTable *t, const uint8_t *in, int initialState,
 
 #ifdef FSE_CODEC_SELFTEST
 int main(void) {
-    /* Symbol alphabet: 8 literal byte values used in the demo tile, plus
-     * ESCAPE=256 marking the start of an LZ-match token. */
+
     int symbolValue[] = {0x00, 0x05, 0x06, 0x0A, 0x11, 0x22, 0xAA, 0xBB, 256};
     int freq[]         = {   1,    1,    1,    1,    1,    1,    1,    1,   8};
     int nbSymbols = 9, tableLog = 4;
@@ -223,9 +170,6 @@ int main(void) {
                s, t.table[s].symbol, t.table[s].nbBits, t.table[s].newStateBase);
     }
 
-    /* Test sequence: 6 literals then an ESCAPE + 3-byte match token
-     * (offset_hi=0x00, offset_lo=0x06, length=0x06), i.e. our 16-byte
-     * tile's compressed token stream. */
     int symbols[] = {0x05, 0xAA, 0xBB, 0x0A, 0x11, 0x22, 256, 0x00, 0x06, 0x06};
     int n = sizeof(symbols)/sizeof(symbols[0]);
 
